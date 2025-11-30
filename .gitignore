@@ -1,0 +1,94 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+venv/
+env/
+
+# Sequencing data (too large)
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.bam
+*.sam
+*.bai
+
+# Kraken2/Bracken outputs (large, regenerable)
+*.kraken
+*.kreport
+*.bracken
+*.breport
+
+# SortMeRNA workdir
+sortmerna_workdir/
+
+# Database files (too large)
+*.bt2
+*.bt2l
+*.k2d
+*.fasta
+*.fna
+*.faa
+*.gff
+gene_strain_table.tsv
+
+# Large output directories (regenerable)
+# Note: /preprocessing/ and /alignment/ at root level for output data
+# Scripts in scripts/preprocessing/ and scripts/alignment/ are tracked
+/preprocessing/
+/alignment/
+functional_annotation/output/
+PROKKA_DEGs_filtering/filtered_genes.faa
+
+# eggNOG-mapper intermediate files
+*.emapper.hits
+*.emapper.seed_orthologs
+
+# System files
+.DS_Store
+Thumbs.db
+*~
+
+# Sensitive data
+*.env
+*_credentials.*
+*_private.*
+config.sh
+
+# Large output files (regenerable)
+*.pdf
+*.png
+*.html
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Conda environments
+environment.yml.lock
+
+# STAR temporary files
+*_STARtmp/
+*_STARgenome/
+*Log.out
+*Log.progress.out
+*SJ.out.tab
+
+# featureCounts temporary
+*.featureCounts
+
+# Figures (generated, can be recreated)
+figures/

@@ -1,0 +1,441 @@
+---
+title: "Clinical Data Analysis - Oral Metatranscriptomics and Estrogen"
+author: "Maria J. Rus"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    code_folding: hide
+---
+
+# Setup
+
+Load necessary libraries and set options.
+
+```{r setup, include=FALSE}
+# Required libraries
+library(tidyverse)   # Data manipulation and visualization
+library(knitr)       # Table formatting (kable)
+library(janitor)     # Cleaning column names
+library(ggrepel)     # Label placement in plots
+library(ggpubr)      # Statistical annotations
+library(ggthemes)    # Additional ggplot themes
+library(patchwork)   # Combining plots
+
+# Set default options for code chunks
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Set default theme for ggplot2
+theme_set(theme_minimal())
+
+# Custom theme for publication-quality boxplots
+theme_boxplot <- function() {
+  theme_base(base_size = 12) +
+    theme(
+      line = element_line(size = 0.8),
+      text = element_text(size = 18),
+      axis.text.x = element_text(color = "black"),
+      axis.text.y = element_text(color = "black"),
+      plot.background = element_blank()
+    )
+}
+```
+
+# 1. Load Data
+
+Read the clinical data from the text file. Note the tab separator and comma decimal.
+
+```{r load_data}
+# Path relative to this Rmd file's location
+# Update this path to match your data location
+file_path <- "../data/clinical_data.txt"
+
+# Read the data using read_delim for flexibility
+clinical_data_raw <- read_delim(
+  file_path,
+  delim = "\t",
+  escape_double = FALSE,
+  trim_ws = TRUE,
+  locale = locale(decimal_mark = ","),  # European decimal format
+  na = c("", "NA", "NaN", "Px")         # Define NA strings
+)
+
+# Display dimensions and first rows
+print(paste("Dimensions:", dim(clinical_data_raw)[1], "rows,",
+            dim(clinical_data_raw)[2], "columns"))
+head(clinical_data_raw) %>% kable(caption = "First 6 rows of raw data")
+```
+
+# 2. Data Cleaning & Preprocessing
+
+Clean column names and ensure correct data types.
+
+```{r clean_data}
+# Clean column names (convert to snake_case)
+clinical_data_clean <- clinical_data_raw %>%
+  janitor::clean_names()
+
+# Display cleaned column names
+print("Cleaned column names:")
+names(clinical_data_clean) %>% head(20)
+
+# Identify numeric columns that may need type conversion
+numeric_cols_to_convert <- c(
+  "age", "days_btw", "nt_ipc",
+  "estrogen_sa_t1", "estrogen_sa_t2",
+  "d1_fsh", "d1_e2", "d1_lh", "d1_endometrial_size",
+  "lh_day_before_px",
+  "oocytes_retrieved", "mii", "assigned", "fertilized",
+  "embryos_transferred", "embryos_cryopreserved"
+)
+
+# Also include dynamic E2 and Endometrial Size columns
+e2_dynamic_cols <- names(clinical_data_clean) %>% str_subset("^d[0-9]+_e2$")
+endo_dynamic_cols <- names(clinical_data_clean) %>%
+  str_subset("^endometrial_size_d[0-9]+$|^d[0-9]+$") %>%
+  setdiff(names(clinical_data_clean)[grepl("_e2$|_fsh$|_lh$", names(clinical_data_clean))])
+
+all_numeric_cols <- unique(c(numeric_cols_to_convert, e2_dynamic_cols, endo_dynamic_cols))
+
+# Apply type conversion
+clinical_data_typed <- clinical_data_clean %>%
+  mutate(across(
+    any_of(all_numeric_cols),
+    ~ suppressWarnings(as.numeric(str_replace(., ",", ".")))
+  ))
+
+# Display structure
+glimpse(clinical_data_typed)
+```
+
+# 3. Feature Engineering
+
+Calculate derived variables needed for analysis.
+
+```{r feature_engineering}
+# 3.1 Total Gonadotropin Doses
+# Identify dose columns
+dose_col_names <- names(clinical_data_typed)[
+  names(clinical_data_typed) == "gonadotrophies_injected_per_day_during_treatment_1" |
+  grepl("^x\\d{1,2}$", names(clinical_data_typed))
+]
+
+# Calculate total doses per patient
+dose_data <- clinical_data_typed %>%
+  select(subject_id, all_of(dose_col_names))
+
+total_doses <- dose_data %>%
+  pivot_longer(
+    cols = -subject_id,
+    names_to = "treatment_day_col",
+    values_to = "dose_string",
+    values_drop_na = TRUE
+  ) %>%
+  filter(dose_string != "" & !is.na(dose_string)) %>%
+  separate(dose_string, into = c("dose1_str", "dose2_str"),
+           sep = "/", fill = "right", remove = FALSE) %>%
+  mutate(
+    dose1 = suppressWarnings(as.numeric(str_replace(dose1_str, ",", "."))),
+    dose2 = suppressWarnings(as.numeric(str_replace(dose2_str, ",", ".")))
+  ) %>%
+  group_by(subject_id) %>%
+  summarise(
+    total_gonadotropin_dose1 = sum(dose1, na.rm = TRUE),
+    total_gonadotropin_dose2 = sum(dose2, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Join total doses back to main data
+clinical_data_processed <- clinical_data_typed %>%
+  left_join(total_doses, by = "subject_id")
+
+# 3.2 T2 Values & E2 Change
+# Function to find the last non-NA numeric value
+find_last_numeric_value <- function(row_values) {
+  last_val <- tail(na.omit(row_values), 1)
+  if (length(last_val) == 0) {
+    return(NA_real_)
+  } else {
+    return(last_val)
+  }
+}
+
+# T2_E2: Last E2 measurement (excluding D1)
+e2_cols_t2 <- names(clinical_data_processed) %>% str_subset("^d(?!1_e2)[0-9]+_e2$")
+clinical_data_processed <- clinical_data_processed %>%
+  mutate(
+    t2_e2 = apply(select(., all_of(e2_cols_t2)), 1, find_last_numeric_value)
+  )
+
+# T2_Endometrial_Size: Last Endometrial Size measurement
+endo_size_cols_t2 <- names(clinical_data_processed) %>%
+  str_subset("^endometrial_size_d[0-9]+$|^d[0-9]+$") %>%
+  setdiff(names(clinical_data_processed)[grepl("_e2$|_fsh$|_lh$", names(clinical_data_processed))])
+clinical_data_processed <- clinical_data_processed %>%
+  mutate(
+    t2_endometrial_size = apply(select(., all_of(endo_size_cols_t2)), 1, find_last_numeric_value)
+  )
+
+# Rename LH column for consistency
+clinical_data_processed <- clinical_data_processed %>%
+  rename(t2_lh = lh_day_before_px)
+
+# Calculate E2 change metrics
+clinical_data_processed <- clinical_data_processed %>%
+  mutate(
+    e2_change = t2_e2 - d1_e2,
+    e2_change_normalized = (t2_e2 - d1_e2) / days_btw,
+    e2_change_normalized = if_else(
+      is.infinite(e2_change_normalized) | is.na(e2_change_normalized),
+      NA_real_,
+      e2_change_normalized
+    )
+  )
+
+# Display engineered features
+head(clinical_data_processed %>%
+  select(subject_id, total_gonadotropin_dose1, total_gonadotropin_dose2,
+         d1_e2, t2_e2, e2_change_normalized)) %>%
+  kable(caption = "Engineered Features Summary")
+```
+
+# 4. Paired Comparisons (T1 vs T2)
+
+## 4.1 Blood Estradiol (E2) Change
+
+Analyze and visualize the change in blood estradiol levels between timepoints.
+
+```{r blood_e2_comparison, fig.height=3, fig.width=4}
+# Prepare data for paired analysis
+e2_data <- clinical_data_processed %>%
+  select(subject_id, d1_e2, t2_e2) %>%
+  filter(!is.na(d1_e2) & !is.na(t2_e2))
+
+# Reshape for plotting
+e2_data_long <- e2_data %>%
+  pivot_longer(
+    cols = c(d1_e2, t2_e2),
+    names_to = "Timepoint",
+    values_to = "E2_Level"
+  ) %>%
+  mutate(Timepoint = factor(Timepoint, levels = c("d1_e2", "t2_e2"), labels = c("T1", "T2")))
+
+# Paired Wilcoxon test
+p_value_e2_text <- "Test not run (insufficient data)"
+if (nrow(e2_data) > 1) {
+  wilcox_test_e2 <- wilcox.test(e2_data$t2_e2, e2_data$d1_e2, paired = TRUE, exact = FALSE)
+  p_value_e2 <- wilcox_test_e2$p.value
+  p_value_e2_text <- if (p_value_e2 < 0.001) "p < 0.001" else paste("p =", format(round(p_value_e2, 3), nsmall = 3))
+  print("Wilcoxon Test: T1 vs T2 Blood E2")
+  print(wilcox_test_e2)
+}
+
+# Visualization
+max_y_e2 <- max(e2_data_long$E2_Level, na.rm = TRUE)
+annotation_y_e2 <- max_y_e2 * 1.1
+
+# Generate p-value label for plotmath
+p_value_numeric <- wilcox_test_e2$p.value
+if (is.na(p_value_numeric) || !is.finite(p_value_numeric)) {
+  p_label_string <- "italic(p) == NA"
+} else if (p_value_numeric < 0.001) {
+  p_label_string <- "italic(p) < 0.001"
+} else {
+  p_formatted <- format(round(p_value_numeric, 3), nsmall = 3)
+  p_label_string <- paste0("italic(p) == ", p_formatted)
+}
+
+plot_e2_paired <- ggplot(e2_data_long, aes(x = Timepoint, y = E2_Level)) +
+  geom_boxplot(aes(group = Timepoint), width = 0.2, alpha = 0.7,
+               outlier.shape = NA, lwd = 0.6) +
+  geom_point(aes(shape = Timepoint), color = "black", fill = "#d40031",
+             size = 5, stroke = 0.5, alpha = 0.8,
+             position = position_jitter(width = 0.08, height = 0)) +
+  annotate("text", x = 1.5, y = annotation_y_e2,
+           label = p_label_string, size = 4, parse = TRUE) +
+  annotate("segment", x = 1, xend = 2,
+           y = annotation_y_e2 * 0.95, yend = annotation_y_e2 * 0.95,
+           colour = "black", lwd = 0.6) +
+  scale_shape_manual(values = c(21, 22)) +
+  labs(x = "Time Point", y = "E2 Serum Level (pg/mL)") +
+  theme_boxplot() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text = element_text(size = 14, colour = "black"),
+    legend.position = "none"
+  )
+
+print(plot_e2_paired)
+```
+
+## 4.2 Salivary Estrogen Change
+
+Analyze and visualize the change in salivary estrogen levels.
+
+```{r saliva_e2_comparison, fig.height=3, fig.width=4}
+# Prepare data
+sa_data <- clinical_data_processed %>%
+  select(subject_id, estrogen_sa_t1, estrogen_sa_t2) %>%
+  filter(!is.na(estrogen_sa_t1) & !is.na(estrogen_sa_t2))
+
+# Reshape for plotting
+sa_data_long <- sa_data %>%
+  pivot_longer(
+    cols = c(estrogen_sa_t1, estrogen_sa_t2),
+    names_to = "Timepoint_Var",
+    values_to = "SA_Level"
+  ) %>%
+  mutate(Timepoint = factor(Timepoint_Var,
+                            levels = c("estrogen_sa_t1", "estrogen_sa_t2"),
+                            labels = c("T1", "T2")))
+
+# Paired Wilcoxon test
+p_value_sa_text <- "Test not run (insufficient data)"
+if (nrow(sa_data) > 1) {
+  wilcox_test_sa <- wilcox.test(sa_data$estrogen_sa_t2, sa_data$estrogen_sa_t1,
+                                paired = TRUE, exact = FALSE)
+  p_value_sa <- wilcox_test_sa$p.value
+  p_value_sa_text <- if (p_value_sa < 0.001) "p < 0.001" else paste("p =", format(round(p_value_sa, 3), nsmall = 3))
+  print("Wilcoxon Test: T1 vs T2 Salivary Estrogen")
+  print(wilcox_test_sa)
+}
+
+# Visualization
+max_y_sa <- max(sa_data_long$SA_Level, na.rm = TRUE)
+annotation_y_sa <- max_y_sa * 1.15
+
+# Generate p-value label
+p_value_numeric_sa <- wilcox_test_sa$p.value
+if (is.na(p_value_numeric_sa) || !is.finite(p_value_numeric_sa)) {
+  p_label_string_sa <- "italic(p) == NA"
+} else if (p_value_numeric_sa < 0.001) {
+  p_label_string_sa <- "italic(p) < 0.001"
+} else {
+  p_formatted_sa <- format(round(p_value_numeric_sa, 3), nsmall = 3)
+  p_label_string_sa <- paste0("italic(p) == ", p_formatted_sa)
+}
+
+plot_sa_paired <- ggplot(sa_data_long, aes(x = Timepoint, y = SA_Level)) +
+  geom_boxplot(aes(group = Timepoint), width = 0.2, alpha = 0.7,
+               outlier.shape = NA, lwd = 0.6) +
+  geom_point(aes(shape = Timepoint), color = "black", fill = "#0059db",
+             size = 5, stroke = 0.5, alpha = 0.8,
+             position = position_jitter(width = 0.08, height = 0)) +
+  annotate("text", x = 1.5, y = annotation_y_sa,
+           label = p_label_string_sa, size = 4, parse = TRUE) +
+  annotate("segment", x = 1, xend = 2,
+           y = annotation_y_sa * 0.95, yend = annotation_y_sa * 0.95,
+           colour = "black", lwd = 0.6) +
+  scale_shape_manual(values = c(21, 22)) +
+  labs(x = "Time Point", y = "E2 Saliva Level (pg/mL)") +
+  theme_boxplot() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text = element_text(size = 14, colour = "black"),
+    legend.position = "none"
+  )
+
+print(plot_sa_paired)
+```
+
+## 4.3 Combined Figure
+
+Combine serum and saliva plots for publication.
+
+```{r combined_hormone_plot, fig.height=3, fig.width=8}
+# Remove x-axis title for combined plot
+plot_e2_combined <- plot_e2_paired + labs(x = NULL)
+plot_sa_combined <- plot_sa_paired + labs(x = NULL)
+
+# Combine plots with patchwork
+combined_plot <- plot_e2_combined + plot_sa_combined
+
+print(combined_plot)
+
+# Save combined figure
+ggsave(
+  filename = "../figures/Fig1_Serum_Saliva_Paired.pdf",
+  plot = combined_plot,
+  device = cairo_pdf,
+  width = 7, height = 3, units = "in", dpi = 300
+)
+```
+
+# 5. Hormone Correlations
+
+## 5.1 Blood Estrogen vs Salivary Estrogen
+
+```{r e2_sa_correlation, fig.height=3.5, fig.width=8}
+# Prepare correlation data
+e2_sa_data <- clinical_data_processed %>%
+  select(subject_id, d1_e2, estrogen_sa_t1, t2_e2, estrogen_sa_t2)
+
+cor_t1_data <- e2_sa_data %>% filter(!is.na(d1_e2) & !is.na(estrogen_sa_t1))
+cor_t2_data <- e2_sa_data %>% filter(!is.na(t2_e2) & !is.na(estrogen_sa_t2))
+
+print(paste("N for T1 E2 vs SA correlation:", nrow(cor_t1_data)))
+print(paste("N for T2 E2 vs SA correlation:", nrow(cor_t2_data)))
+
+# T1 correlation plot
+plot_e2_sa_t1 <- ggplot(cor_t1_data, aes(x = d1_e2, y = estrogen_sa_t1)) +
+  stat_smooth(method = "lm", se = TRUE, fill = "grey80",
+              colour = "black", alpha = 0.3, lwd = 0.6) +
+  geom_point(shape = 21, size = 5, stroke = 0.5, alpha = 0.8,
+             color = "black", fill = "#1E8449") +
+  stat_cor(method = "spearman", cor.coef.name = "rho",
+           aes(label = paste(after_stat(r.label), after_stat(p.label), sep = "~`,`~")),
+           label.x.npc = "left", label.y.npc = "top", size = 4.5) +
+  labs(title = "T1", x = "E2 Serum Level (pg/mL)", y = "E2 Saliva Level (pg/mL)") +
+  theme_boxplot() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text = element_text(size = 14, colour = "black"),
+    plot.title = element_text(hjust = 0.5, face = "plain", size = 16)
+  )
+
+# T2 correlation plot
+plot_e2_sa_t2 <- ggplot(cor_t2_data, aes(x = t2_e2, y = estrogen_sa_t2)) +
+  stat_smooth(method = "lm", se = TRUE, fill = "grey80",
+              colour = "black", alpha = 0.3, lwd = 0.6) +
+  geom_point(shape = 22, size = 5, stroke = 0.5, alpha = 0.8,
+             color = "black", fill = "#1E8449") +
+  stat_cor(method = "spearman", cor.coef.name = "rho",
+           aes(label = paste(after_stat(r.label), after_stat(p.label), sep = "~`,`~")),
+           label.x.npc = "left", label.y.npc = "top", size = 4.5) +
+  labs(title = "T2", x = "E2 Serum Level (pg/mL)", y = "E2 Saliva Level (pg/mL)") +
+  theme_boxplot() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text = element_text(size = 14, colour = "black"),
+    plot.title = element_text(hjust = 0.5, face = "plain", size = 16)
+  )
+
+# Combine correlation plots
+combined_cor_plot <- plot_e2_sa_t1 + plot_e2_sa_t2
+
+print(combined_cor_plot)
+
+# Save figure
+ggsave(
+  filename = "../figures/Fig2_E2_Correlation.pdf",
+  plot = combined_cor_plot,
+  device = cairo_pdf,
+  width = 8, height = 3.5, units = "in", dpi = 300
+)
+```
+
+# 6. Session Info
+
+```{r session_info}
+sessionInfo()
+```

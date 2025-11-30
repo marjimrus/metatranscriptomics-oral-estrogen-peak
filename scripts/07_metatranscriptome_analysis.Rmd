@@ -1,0 +1,551 @@
+---
+title: "Metatranscriptome Analysis Pipeline"
+author: "Maria J. Rus"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# =============================================================================
+# Required Libraries
+# =============================================================================
+# Install if necessary:
+# install.packages(c("tidyverse", "pheatmap", "data.table", "ggsci"))
+# BiocManager::install(c("DESeq2", "fgsea", "KEGGREST", "enrichplot", "EnhancedVolcano"))
+
+library(tidyverse)
+library(DESeq2)
+library(pheatmap)
+library(EnhancedVolcano)
+library(ggplot2)
+library(ggrepel)
+library(fgsea)
+library(data.table)
+library(KEGGREST)
+library(enrichplot)
+library(ggsci)
+
+# =============================================================================
+# File Paths (Relative to script location)
+# =============================================================================
+# Update these paths to match your data location
+metadata_file <- "../data/metadata.tsv"
+count_file <- "../alignment/microbiome_homd/counts/gene_counts_matrix.tsv"
+gene_species_map_file <- "../data/gene_strain_table.tsv"
+kegg_hierarchy_file <- "PROKKA_DEGs_filtering/ko00001.keg"
+
+# Output directory
+output_dir <- "PROKKA_DEGs_filtering"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+
+# Output files
+filtered_gene_ids_file <- file.path(output_dir, "filtered_gene_ids.txt")
+eggnog_annotation_file <- file.path(output_dir, "eggnog_output.emapper.annotations")
+gsea_ko_annotated_file <- file.path(output_dir, "gsea_ko_annotated_keggrest.tsv")
+cytoscape_node_file <- file.path(output_dir, "cytoscape_nodes_ko.tsv")
+cytoscape_edge_file <- file.path(output_dir, "cytoscape_edges_ko_similarity.tsv")
+
+# =============================================================================
+# Analysis Parameters
+# =============================================================================
+# Filtering criteria (matching M&M: >= 10 counts in >= 5 samples)
+min_count_threshold <- 10
+min_samples_abs_threshold <- 5
+
+# Significance thresholds
+deseq2_padj_threshold <- 0.05
+gsea_padj_threshold <- 0.05
+gsea_kegg_padj_threshold_cytoscape <- 0.1
+similarity_threshold_cytoscape <- 0.1
+
+# Metadata column names
+patient_col <- "SubjectID"
+time_col <- "Timepoint"
+sample_name_col <- "SampleID"
+
+# Plotting theme
+theme_set(theme_bw(base_size = 12))
+```
+
+# 1. Introduction
+
+This document details the analysis of metatranscriptomic data from oral subgingival plaque samples collected from 10 women before (T1) and after (T2) hormonal induction treatment for oocyte donation. The goal is to identify differentially expressed bacterial genes and associated functional pathways potentially related to estrogen fluctuations.
+
+The analysis includes:
+
+- Data loading and preparation
+- Low-count gene filtering
+- Exploratory Data Analysis (EDA) using PCA
+- Differential Gene Expression (DGE) using DESeq2 with a paired design
+- Functional annotation using eggNOG-mapper (external step)
+- Functional enrichment using Gene Set Enrichment Analysis (GSEA) with KEGG Orthology (KO) terms
+- Exporting results for network visualization in Cytoscape
+
+# 2. Data Loading and Preparation
+
+## 2.1 Load Count Matrix
+
+The count matrix was generated using featureCounts after aligning reads to the PROKKA-annotated HOMD reference genomes.
+
+```{r load_counts}
+# Read the featureCounts output
+raw_counts_data <- read.delim(count_file, comment.char = '#', header = TRUE, sep = "\t")
+
+# Remove metadata columns if present (Chr, Start, End, Strand, Length)
+if ("Chr" %in% colnames(raw_counts_data)) {
+  count_matrix_raw <- raw_counts_data[, -c(2:6)] %>%
+    column_to_rownames(var = "Geneid")
+} else {
+  count_matrix_raw <- raw_counts_data %>%
+    column_to_rownames(var = names(raw_counts_data)[1])
+}
+
+# Clean up sample names to format: SubjectID.Timepoint (e.g., EST007.1)
+original_colnames <- colnames(count_matrix_raw)
+cleaned_colnames <- gsub(".*(EST\\d+).*T(\\d).*", "\\1.\\2", original_colnames)
+colnames(count_matrix_raw) <- cleaned_colnames
+
+print(paste("Raw count matrix dimensions:", paste(dim(count_matrix_raw), collapse = " x ")))
+print("First 5 rows/cols of raw count matrix:")
+count_matrix_raw[1:5, 1:5]
+```
+
+## 2.2 Load Metadata
+
+The metadata file links sample names to experimental factors (SubjectID, Timepoint).
+
+```{r load_metadata}
+metadata_raw <- read.delim(metadata_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+
+# Verify required columns exist
+required_cols <- c(sample_name_col, patient_col, time_col)
+if (!all(required_cols %in% colnames(metadata_raw))) {
+  stop(paste("Metadata file is missing required columns:", paste(required_cols, collapse = ", ")))
+}
+
+# Ensure metadata SampleID format matches count matrix colnames
+metadata <- metadata_raw %>%
+  mutate(!!sample_name_col := gsub("_", ".", !!sym(sample_name_col)))
+
+# Check sample name matching
+if (!all(colnames(count_matrix_raw) %in% metadata[[sample_name_col]])) {
+  missing_samples <- colnames(count_matrix_raw)[!colnames(count_matrix_raw) %in% metadata[[sample_name_col]]]
+  stop(paste("Sample names not found in metadata:", paste(missing_samples, collapse = "\n")))
+}
+
+# Filter and order metadata to match count matrix
+metadata_filtered <- metadata %>%
+  filter(.data[[sample_name_col]] %in% colnames(count_matrix_raw)) %>%
+  arrange(match(.data[[sample_name_col]], colnames(count_matrix_raw)))
+
+# Ensure count matrix columns match metadata order
+count_matrix <- count_matrix_raw[, metadata_filtered[[sample_name_col]]]
+
+# Convert to factors
+metadata_final <- metadata_filtered %>%
+  mutate(
+    !!patient_col := factor(!!sym(patient_col)),
+    !!time_col := factor(!!sym(time_col), levels = c("1", "2"))  # T1 is reference
+  )
+
+print("Final Metadata structure:")
+str(metadata_final)
+print("Timepoint levels (should be 1, 2):")
+print(levels(metadata_final[[time_col]]))
+```
+
+# 3. Low-Count Gene Filtering
+
+Genes with very low counts provide little information and inflate multiple testing burden.
+
+```{r filter_low_counts}
+# Filter: Keep genes with >= min_count_threshold in >= min_samples_abs_threshold samples
+keep_genes <- rowSums(count_matrix >= min_count_threshold) >= min_samples_abs_threshold
+filtered_count_matrix <- count_matrix[keep_genes, ]
+
+print(paste("Filtering: Keeping genes with at least", min_count_threshold,
+            "counts in at least", min_samples_abs_threshold, "samples."))
+print(paste("Dimensions before filtering:", paste(dim(count_matrix), collapse = " x ")))
+print(paste("Dimensions after filtering:", paste(dim(filtered_count_matrix), collapse = " x ")))
+print(paste("Number of genes removed:", nrow(count_matrix) - nrow(filtered_count_matrix)))
+
+# Save filtered gene IDs for sequence extraction (required for eggNOG)
+filtered_gene_ids <- rownames(filtered_count_matrix)
+writeLines(filtered_gene_ids, filtered_gene_ids_file)
+print(paste("Filtered gene IDs written to:", filtered_gene_ids_file))
+```
+
+# 4. Exploratory Data Analysis (EDA)
+
+PCA to visualize sample relationships and justify paired design.
+
+```{r eda_pca, fig.width=7, fig.height=5}
+# Create temporary DESeq object for normalization
+temp_dds <- DESeqDataSetFromMatrix(
+  countData = filtered_count_matrix,
+  colData = metadata_final,
+  design = ~ 1
+)
+
+# Variance-stabilizing transformation
+vsd <- vst(temp_dds, blind = TRUE)
+
+# PCA
+pca_data <- plotPCA(vsd, intgroup = c(time_col, patient_col), returnData = TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"))
+
+# PCA plot with subject coloring and timepoint shapes
+pca_plot <- ggplot(pca_data, aes(x = PC1, y = PC2,
+                                  fill = .data[[patient_col]],
+                                  shape = .data[[time_col]])) +
+  geom_point(size = 5, stroke = 0.5, color = "black") +
+  ggsci::scale_fill_d3(palette = "category20", name = patient_col) +
+  scale_shape_manual(values = c("1" = 21, "2" = 24), name = time_col) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 12),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 12, colour = "black")
+  ) +
+  guides(
+    fill = guide_legend(title = patient_col,
+                        override.aes = list(shape = 21, size = 4, color = "black")),
+    shape = guide_legend(title = time_col,
+                         override.aes = list(size = 4, color = "black", fill = "white"))
+  )
+
+print(pca_plot)
+
+# Save PCA plot
+ggsave("../figures/Fig_PCA.pdf", plot = pca_plot, device = cairo_pdf,
+       width = 7, height = 5, units = "in", dpi = 300)
+```
+
+**Interpretation:** The PCA plot shows samples clustering primarily by SubjectID (color), indicating strong inter-individual variation. The separation between Timepoint 1 (circles) and 2 (triangles) within each subject is much smaller. This pattern justifies the use of a paired statistical design (`~ SubjectID + Timepoint`).
+
+# 5. Differential Gene Expression (DGE) with DESeq2
+
+## 5.1 Run DESeq2 Analysis
+
+```{r deseq2_analysis}
+# Create DESeqDataSet with paired design
+dds <- DESeqDataSetFromMatrix(
+  countData = filtered_count_matrix,
+  colData = metadata_final,
+  design = formula(paste0("~ ", patient_col, " + ", time_col))
+)
+
+# Run DESeq2
+dds <- DESeq(dds)
+
+# Extract results for T2 vs T1
+results_name <- resultsNames(dds)[length(resultsNames(dds))]
+print(paste("Extracting results for coefficient:", results_name))
+
+res_deseq2 <- results(dds, name = results_name, alpha = deseq2_padj_threshold)
+
+# Convert to data frame and order by padj
+res_deseq2_df <- as.data.frame(res_deseq2) %>%
+  rownames_to_column(var = "GeneID") %>%
+  arrange(padj)
+
+print("DESeq2 Results Summary (T2 vs T1):")
+summary(res_deseq2, alpha = deseq2_padj_threshold)
+
+# Identify significant DEGs
+deseq2_sig_genes <- res_deseq2_df %>%
+  filter(padj < deseq2_padj_threshold) %>%
+  pull(GeneID)
+
+print(paste("Number of significant DEGs (padj <", deseq2_padj_threshold, "):", length(deseq2_sig_genes)))
+
+# Prepare ranked list for GSEA
+deseq2_ranked_genes <- res_deseq2_df %>%
+  filter(!is.na(stat)) %>%
+  arrange(desc(stat)) %>%
+  dplyr::select(GeneID, stat) %>%
+  deframe()
+
+print(paste("Prepared ranked list of", length(deseq2_ranked_genes), "genes for GSEA."))
+```
+
+## 5.2 Volcano Plot
+
+```{r volcano_plot, fig.width=6, fig.height=5}
+volcano_plot <- EnhancedVolcano(
+  res_deseq2_df,
+  lab = NA,
+  x = 'log2FoldChange',
+  y = 'padj',
+  title = 'DESeq2 Results (T2 vs T1)',
+  pCutoff = deseq2_padj_threshold,
+  FCcutoff = 1.0,
+  pointSize = 2.0,
+  labSize = 3.0,
+  colAlpha = 0.6,
+  legendPosition = 'right',
+  legendLabSize = 10,
+  legendIconSize = 3.0
+) +
+  theme_bw() +
+  theme(
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  coord_cartesian(ylim = c(0, 3.0))
+
+print(volcano_plot)
+
+ggsave("../figures/Fig_Volcano.pdf", plot = volcano_plot, device = cairo_pdf,
+       width = 6, height = 5, units = "in", dpi = 300)
+```
+
+# 6. Functional Annotation (External Step)
+
+Before proceeding, run the external annotation steps:
+
+1. **Extract sequences** for filtered genes:
+```bash
+python scripts/functional_annotation/01_extract_sequences.py \
+    -f /path/to/HOMD_PROKKA/ALL_genomes.faa \
+    -i PROKKA_DEGs_filtering/filtered_gene_ids.txt \
+    -o PROKKA_DEGs_filtering/filtered_genes.faa
+```
+
+2. **Run eggNOG-mapper**:
+```bash
+bash scripts/functional_annotation/02_eggnog_mapper.sh
+```
+
+# 7. Load and Process Functional Annotations
+
+```{r load_annotations}
+# Check if annotation file exists
+if (!file.exists(eggnog_annotation_file)) {
+  stop(paste("eggNOG-mapper annotation file not found:", eggnog_annotation_file,
+             "\nPlease run the external annotation step first."))
+}
+
+# Load annotations
+annot_raw <- fread(eggnog_annotation_file, sep = "\t", header = TRUE, skip = "#", quote = "")
+print("Annotation columns:")
+print(colnames(annot_raw))
+
+# Process annotations
+annotations_df <- annot_raw %>%
+  as_tibble() %>%
+  rename(GeneID = "#query") %>%
+  select(
+    GeneID,
+    Seed_ortholog = `seed_ortholog`,
+    GOs,
+    KEGG_ko,
+    KEGG_Pathway,
+    Description = any_of(c("Description", "Preferred_name"))
+  ) %>%
+  distinct(GeneID, .keep_all = TRUE)
+
+print(paste("Loaded", nrow(annotations_df), "annotations for",
+            length(unique(annotations_df$GeneID)), "unique genes."))
+
+# Prepare KEGG KO gene sets for GSEA
+kegg_ko_list <- annotations_df %>%
+  filter(KEGG_ko != "" & !is.na(KEGG_ko) & KEGG_ko != "-") %>%
+  select(GeneID, KEGG_ko) %>%
+  mutate(KEGG_ko = gsub("ko:", "", KEGG_ko)) %>%
+  separate_rows(KEGG_ko, sep = ",") %>%
+  filter(KEGG_ko != "") %>%
+  select(term = KEGG_ko, gene = GeneID) %>%
+  distinct()
+
+kegg_ko_pathways <- split(kegg_ko_list$gene, kegg_ko_list$term)
+print(paste("Prepared", length(kegg_ko_pathways), "KEGG KO pathways for GSEA."))
+```
+
+# 8. Gene Set Enrichment Analysis (GSEA)
+
+## 8.1 Run fgsea
+
+```{r gsea_kegg_run}
+print("Running GSEA with fgsea for KEGG KO terms...")
+set.seed(42)
+
+fgsea_results_ko <- fgsea(
+  pathways = kegg_ko_pathways,
+  stats = deseq2_ranked_genes,
+  minSize = 15,
+  maxSize = 500,
+  nproc = 0
+)
+
+# Convert to tibble and arrange
+gsea_results_ko_df <- fgsea_results_ko %>%
+  as_tibble() %>%
+  arrange(padj)
+
+print(paste("GSEA completed. Found", nrow(gsea_results_ko_df), "total KO terms tested."))
+print(paste("Number of significant KO terms (padj <", gsea_padj_threshold, "):",
+            sum(gsea_results_ko_df$padj < gsea_padj_threshold, na.rm = TRUE)))
+```
+
+## 8.2 Annotate GSEA Results with KEGG Descriptions
+
+```{r gsea_kegg_annotate}
+# Function to fetch KEGG KO annotations
+annotate_kegg_ko_keggrest <- function(ko_id) {
+  query_id <- paste0("ko:", ko_id)
+  ko_name <- "N/A"
+  ko_definition <- "N/A"
+  pathway_names <- "N/A"
+
+  tryCatch({
+    entry_info <- keggGet(query_id)
+    if (!is.null(entry_info) && is.list(entry_info) && length(entry_info) > 0) {
+      ko_data <- entry_info[[1]]
+      ko_name <- ifelse(!is.null(ko_data$NAME), paste(ko_data$NAME, collapse = "; "), "N/A")
+      ko_definition <- ifelse(!is.null(ko_data$DEFINITION), ko_data$DEFINITION, "N/A")
+      pathway_info <- ko_data$PATHWAY
+      pathway_names <- ifelse(!is.null(pathway_info),
+                              paste(names(pathway_info), pathway_info, sep = ": ", collapse = " | "),
+                              "N/A")
+    }
+  }, error = function(e) {
+    # Keep default N/A values
+  })
+
+  return(tibble(
+    pathway = ko_id,
+    Name = ko_definition,
+    `KEGG Pathways` = pathway_names,
+    `Short Name` = ko_name
+  ))
+}
+
+# Get unique KO IDs
+ko_ids_to_annotate <- unique(gsea_results_ko_df$pathway)
+print(paste("Annotating", length(ko_ids_to_annotate), "unique KO IDs..."))
+
+# Annotate all KOs (this may take a while)
+ko_annotations_keggrest <- purrr::map_dfr(ko_ids_to_annotate, annotate_kegg_ko_keggrest)
+
+# Join with GSEA results
+gsea_results_ko_annotated <- left_join(gsea_results_ko_df, ko_annotations_keggrest, by = "pathway") %>%
+  rename(KO_ID = pathway)
+
+# Save annotated results
+fwrite(gsea_results_ko_annotated, gsea_ko_annotated_file, sep = "\t", row.names = FALSE)
+print(paste("Annotated GSEA results saved to:", gsea_ko_annotated_file))
+```
+
+## 8.3 GSEA Plot
+
+```{r gsea_kegg_plot, fig.width=10, fig.height=8}
+# Select top pathways
+top_n_pathways <- 15
+gsea_results_ko_sorted <- gsea_results_ko_annotated %>% arrange(NES)
+top_ko_neg <- head(gsea_results_ko_sorted, top_n_pathways)
+top_ko_pos <- tail(gsea_results_ko_sorted, top_n_pathways)
+
+top_ko_data <- bind_rows(top_ko_pos, top_ko_neg) %>%
+  arrange(NES) %>%
+  mutate(pathway_label = paste0(KO_ID, ": ", str_trunc(Name, width = 60)))
+
+# Create plot
+gsea_ko_plot <- ggplot(top_ko_data, aes(x = reorder(pathway_label, NES), y = NES, fill = NES > 0)) +
+  geom_col(alpha = 0.8) +
+  scale_fill_manual(
+    values = c("TRUE" = "firebrick", "FALSE" = "steelblue"),
+    name = "Enrichment Direction",
+    labels = c("Downregulated in T2", "Upregulated in T2")
+  ) +
+  coord_flip() +
+  labs(
+    x = "KEGG Orthology (KO) Term",
+    y = "Normalized Enrichment Score (NES)",
+    title = paste("Top", top_n_pathways, "Up/Down Enriched KO Terms by NES (GSEA)")
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+print(gsea_ko_plot)
+
+ggsave("../figures/Fig_GSEA_KO.pdf", plot = gsea_ko_plot, device = cairo_pdf,
+       width = 10, height = 8, units = "in", dpi = 300)
+```
+
+# 9. Cytoscape Network Export
+
+Export node and edge files for network visualization.
+
+```{r cytoscape_export}
+# Prepare node data
+nodes_for_cytoscape <- gsea_results_ko_annotated %>%
+  filter(padj < gsea_kegg_padj_threshold_cytoscape) %>%
+  select(
+    id = KO_ID,
+    Name,
+    NES,
+    padj,
+    pval,
+    size
+  ) %>%
+  distinct(id, .keep_all = TRUE)
+
+if (nrow(nodes_for_cytoscape) == 0) {
+  warning(paste("No KO terms passed the significance threshold for Cytoscape export."))
+} else {
+  print(paste("Prepared", nrow(nodes_for_cytoscape), "nodes for Cytoscape."))
+
+  # Calculate pairwise term similarity
+  if (exists("fgsea_results_ko") && nrow(fgsea_results_ko) > 0) {
+    tryCatch({
+      gsea_results_with_sim <- pairwise_termsim(fgsea_results_ko, method = "JC")
+      similarity_matrix <- gsea_results_with_sim@termsim
+
+      if (!is.null(similarity_matrix) && nrow(similarity_matrix) > 0) {
+        # Convert to edge list
+        similarity_df <- as.data.frame(as.table(similarity_matrix))
+        colnames(similarity_df) <- c("source", "target", "weight")
+
+        # Filter edges
+        edges_for_cytoscape <- similarity_df %>%
+          filter(as.character(source) != as.character(target)) %>%
+          filter(source %in% nodes_for_cytoscape$id & target %in% nodes_for_cytoscape$id) %>%
+          filter(weight > similarity_threshold_cytoscape) %>%
+          mutate(source = as.character(source), target = as.character(target))
+
+        print(paste("Prepared", nrow(edges_for_cytoscape), "edges for Cytoscape."))
+
+        # Write files
+        fwrite(nodes_for_cytoscape, cytoscape_node_file, sep = "\t", row.names = FALSE)
+        fwrite(edges_for_cytoscape, cytoscape_edge_file, sep = "\t", row.names = FALSE)
+        print(paste("Cytoscape files saved."))
+      }
+    }, error = function(e) {
+      warning(paste("Error calculating term similarity:", e$message))
+    })
+  }
+}
+```
+
+# 10. Session Info
+
+```{r session_info}
+sessionInfo()
+```
